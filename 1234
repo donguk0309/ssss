@@ -1,0 +1,113 @@
+import hashlib
+from io import BytesIO
+import tkinter as tk
+from tkinter import filedialog, messagebox, Listbox, Scrollbar
+
+# ▣ 가상 YB 파일 저장소 (완전 수식 기반)
+class VirtualYBFile:
+    def __init__(self, name, seed_hash, size):
+        self.name = name
+        self.seed_hash = seed_hash
+        self.size = size
+
+    def formula(self, i):
+        h = hashlib.sha256(f"{self.seed_hash}:{i}".encode()).digest()
+        return h[0]  # 첫 바이트로 수식 생성
+
+    def read_range(self, start, end):
+        return bytes([self.formula(i) for i in range(start, min(end, self.size))])
+
+class YBFileStorage:
+    def __init__(self):
+        self.files = {}
+
+    def create_file(self, name, seed_hash, size):
+        self.files[name] = VirtualYBFile(name, seed_hash, size)
+
+    def upload_file(self, file_path):
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        size = len(data)
+        seed_hash = hashlib.sha256(data).hexdigest()
+        name = file_path.split("/")[-1]
+        self.create_file(name, seed_hash, size)
+        return name
+
+    def download_file(self, name):
+        file = self.files.get(name)
+        if not file:
+            return None
+        data = file.read_range(0, file.size)
+        return BytesIO(data)
+
+    def delete_file(self, name):
+        if name in self.files:
+            del self.files[name]
+
+    def list_files(self):
+        return list(self.files.keys())
+
+fs = YBFileStorage()
+
+# ▣ GUI 애플리케이션
+class YBApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("📂 YB 클라우드 파일 관리자")
+
+        self.upload_btn = tk.Button(root, text="📤 파일 업로드", command=self.upload_file)
+        self.upload_btn.pack(pady=5)
+
+        self.file_listbox = Listbox(root, width=50)
+        self.file_listbox.pack(padx=10, pady=5)
+
+        self.scrollbar = Scrollbar(root)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.file_listbox.config(yscrollcommand=self.scrollbar.set)
+        self.scrollbar.config(command=self.file_listbox.yview)
+
+        self.download_btn = tk.Button(root, text="⬇️ 다운로드", command=self.download_file)
+        self.download_btn.pack(pady=2)
+
+        self.delete_btn = tk.Button(root, text="🗑️ 삭제", command=self.delete_file)
+        self.delete_btn.pack(pady=2)
+
+        self.refresh_list()
+
+    def refresh_list(self):
+        self.file_listbox.delete(0, tk.END)
+        for file in fs.list_files():
+            self.file_listbox.insert(tk.END, file)
+
+    def upload_file(self):
+        path = filedialog.askopenfilename()
+        if path:
+            name = fs.upload_file(path)
+            self.refresh_list()
+            messagebox.showinfo("업로드 완료", f"{name} 업로드 성공!")
+
+    def download_file(self):
+        selected = self.file_listbox.curselection()
+        if not selected:
+            return
+        name = self.file_listbox.get(selected[0])
+        save_path = filedialog.asksaveasfilename(initialfile=name)
+        if save_path:
+            data = fs.download_file(name)
+            with open(save_path, 'wb') as f:
+                f.write(data.read())
+            messagebox.showinfo("다운로드 완료", f"{name} 저장 완료!")
+
+    def delete_file(self):
+        selected = self.file_listbox.curselection()
+        if not selected:
+            return
+        name = self.file_listbox.get(selected[0])
+        fs.delete_file(name)
+        self.refresh_list()
+        messagebox.showinfo("삭제 완료", f"{name} 삭제 완료!")
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = YBApp(root)
+    root.mainloop()
