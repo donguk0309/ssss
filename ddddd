@@ -1,0 +1,242 @@
+import hashlib
+from io import BytesIO
+import tkinter as tk
+from tkinter import filedialog, messagebox, Listbox, Scrollbar
+import serial  # 아두이노 통신용
+
+# ▣ 아두이노와의 시리얼 브릿지
+class ArduinoBridge:
+    def __init__(self, port='COM3', baudrate=9600):  # ❗ 포트 변경 필요
+        self.ser = serial.Serial(port, baudrate, timeout=2)
+
+    def send_file(self, name, seed_hash, size):
+        name_bytes = name.encode('utf-8')[:32].ljust(32, b'\x00')
+        hash_bytes = bytes.fromhex(seed_hash)
+        size_bytes = size.to_bytes(4, 'big')
+        payload = name_bytes + hash_bytes + size_bytes
+        self.ser.write(b'S')  # Save command
+        self.ser.write(payload)
+
+    def list_files(self):
+        self.ser.reset_input_buffer()
+        self.ser.write(b'L')
+        files = []
+        while self.ser.in_waiting >= 100:
+            name = self.ser.read(32).decode('utf-8').rstrip('\x00')
+            hash_bytes = self.ser.read(64)
+            seed_hash = hash_bytes.hex()
+            size = int.from_bytes(self.ser.read(4), 'big')
+            files.append((name, seed_hash, size))
+        return files
+
+    def clear(self):
+        self.ser.write(b'C')
+
+
+# ▣ 수식 기반 가상 YB 파일
+class VirtualYBFile:
+    def __init__(self, name, seed_hash, size):
+        self.name = name
+        self.seed_hash = seed_hash
+        self.size = size
+
+    def formula(self, i):
+        h = hashlib.sha256(f"{self.seed_hash}:{i}".encode()).digest()
+        return h[0]  # 첫 바이트
+
+    def read_range(self, start, end):
+        return bytes([self.formula(i) for i in range(start, min(end, self.size))])
+
+
+# ▣ YB 가상 파일 시스템 + 아두이노 연동
+class YBFileStorage:
+    def __init__(self):
+        self.files = {}
+        self.arduino = ArduinoBridge()  # 포트 설정 필요
+
+    def create_file(self, name, seed_hash, size):
+        self.files[name] = VirtualYBFile(name, seed_hash, size)
+
+    def upload_file(self, file_path):
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        size = len(data)
+        seed_hash = hashlib.sha256(data).hexdigest()
+        name = file_path.split("/")[-1]
+        self.create_file(name, seed_hash, size)
+        self.arduino.send_file(name, seed_hash, size)
+        return name
+
+    def download_file(self, name):
+        file = self.files.get(name)
+        if not file:
+            return None
+        data = file.read_range(0, file.size)
+        return BytesIO(data)
+
+    def delete_file(self, name):
+        if name in self.files:
+            del self.files[name]
+            # EEPROM에서 삭제는 현재 미지원 (전체 초기화만 가능)
+
+    def list_files(self):
+        return list(self.files.keys())
+
+    def refresh_from_arduino(self):
+        arduino_files = self.arduino.list_files()
+        self.files = {}  # 기존 캐시 초기화
+        for name, seed_hash, size in arduino_files:
+            self.create_file(name, seed_hash, size)
+
+
+# ▣ GUI 애플리케이션
+class YBApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("📂 YB 클라우드 (아두이노 USB 기반)")
+
+        self.upload_btn = tk.Button(root, text="📤 업로드", command=self.upload_file)
+        self.upload_btn.pack(pady=5)
+
+        self.file_listbox = Listbox(root, width=50)
+        self.file_listbox.pack(padx=10, pady=5)
+
+        self.scrollbar = Scrollbar(root)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.file_listbox.config(yscrollcommand=self.scrollbar.set)
+        self.scrollbar.config(command=self.file_listbox.yview)
+
+        self.download_btn = tk.Button(root, text="⬇️ 다운로드", command=self.download_file)
+        self.download_btn.pack(pady=2)
+
+        self.delete_btn = tk.Button(root, text="🗑️ 삭제 (캐시만)", command=self.delete_file)
+        self.delete_btn.pack(pady=2)
+
+        self.refresh_btn = tk.Button(root, text="🔄 새로고침", command=self.refresh_list)
+        self.refresh_btn.pack(pady=2)
+
+        self.refresh_list()
+
+    def refresh_list(self):
+        fs.refresh_from_arduino()
+        self.file_listbox.delete(0, tk.END)
+        for file in fs.list_files():
+            self.file_listbox.insert(tk.END, file)
+
+    def upload_file(self):
+        path = filedialog.askopenfilename()
+        if path:
+            name = fs.upload_file(path)
+            self.refresh_list()
+            messagebox.showinfo("업로드 완료", f"{name} 업로드 성공!")
+
+    def download_file(self):
+        selected = self.file_listbox.curselection()
+        if not selected:
+            return
+        name = self.file_listbox.get(selected[0])
+        save_path = filedialog.asksaveasfilename(initialfile=name)
+        if save_path:
+            data = fs.download_file(name)
+            with open(save_path, 'wb') as f:
+                f.write(data.read())
+            messagebox.showinfo("다운로드 완료", f"{name} 저장 완료!")
+
+    def delete_file(self):
+        selected = self.file_listbox.curselection()
+        if not selected:
+            return
+        name = self.file_listbox.get(selected[0])
+        fs.delete_file(name)
+        self.refresh_list()
+        messagebox.showinfo("삭제 완료", f"{name} 캐시 삭제 완료 (EEPROM은 유지됨)")
+
+
+# ▣ 실행 시작
+if __name__ == '__main__':
+    fs = YBFileStorage()
+    root = tk.Tk()
+    app = YBApp(root)
+    root.mainloop()
+
+
+
+
+
+
+#include <EEPROM.h>
+#include <SoftwareSerial.h>
+
+#define MAX_FILES 5
+#define RECORD_SIZE 100  // 64바이트 해시 + 32바이트 이름 + 4바이트 크기
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial) {}
+
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'L') listFiles();
+    else if (cmd == 'S') saveFile();  // 전송된 데이터 저장
+  }
+}
+
+void loop() {
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'L') listFiles();
+    else if (cmd == 'S') saveFile();
+    else if (cmd == 'C') clearFiles();
+  }
+}
+
+void listFiles() {
+  for (int i = 0; i < MAX_FILES; i++) {
+    int base = i * RECORD_SIZE;
+    byte first = EEPROM.read(base);
+    if (first != 0xFF) {
+      // 이름
+      for (int j = 0; j < 32; j++) {
+        char c = EEPROM.read(base + j);
+        Serial.write(c);
+      }
+      // 해시
+      for (int j = 32; j < 96; j++) {
+        byte b = EEPROM.read(base + j);
+        Serial.write(b);
+      }
+      // 크기 (4바이트)
+      for (int j = 96; j < 100; j++) {
+        byte b = EEPROM.read(base + j);
+        Serial.write(b);
+      }
+    }
+  }
+}
+
+void saveFile() {
+  int slot = -1;
+  for (int i = 0; i < MAX_FILES; i++) {
+    int base = i * RECORD_SIZE;
+    if (EEPROM.read(base) == 0xFF) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot == -1) return;
+
+  int base = slot * RECORD_SIZE;
+
+  // 32B 이름, 64B 해시, 4B 크기 수신
+  while (Serial.available() < 100);
+  for (int i = 0; i < 100; i++) {
+    byte b = Serial.read();
+    EEPROM.write(base + i, b);
+  }
+}
+
+void clearFiles() {
+  for (int i = 0; i < MAX_FILES * RECORD_SIZE; i++) {
+    EEPROM.write(i, 0xFF);
+  }
+}
